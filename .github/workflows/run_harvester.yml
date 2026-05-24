@@ -1,0 +1,31 @@
+name: Automated Inventory Harvester Engine
+
+on:
+  schedule:
+    # يشتغل تلقائياً كل 6 ساعات
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # يسمح لك بالتشغيل اليدوي الفوري بضغطة زر
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Clone Repository Data
+      uses: actions/checkout@v3
+
+    - name: Set Up Python Environment
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+
+    - name: Install Core Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Execute Harvesting Engine
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      run: python harvester.py
