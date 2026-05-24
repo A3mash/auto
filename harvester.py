@@ -103,82 +103,68 @@ def validate_product(product_name, product_categories, include_kws, include_cats
 # ==========================================
 # 4. دوال سحب المنتج (مع صياد الصور)
 # ==========================================
-def fetch_single_zid(url, store_id, include_kws, include_cats, exclude_cats):
+def fetch_single_salla(url, store_id, include_kws, include_cats, exclude_cats):
     local_data = []
     current_device = random.choice(scrapers)
     try:
         response = current_device.get(url, timeout=15)
-        if response.status_code != 200: return local_data
-
         soup = BeautifulSoup(response.text, 'html.parser')
-
-        # صياد الصور
+        
+        # 📸 صياد الصور الثابت
         og_image = soup.find("meta", property="og:image")
         final_image_url = og_image["content"] if og_image and og_image.has_attr("content") else ""
 
-        target_data = None
+        prod_name = ""
+        prod_price = 0.0
+        product_categories = []
+        sku = url.split('/')[-1] # حل احتياطي للـ SKU من الرابط مباشرة
+
+        # المحاولة الأولى: عبر الـ JSON التقليدي
+        found_in_json = False
         for script in soup.find_all('script'):
-            if not script.string: continue
-            if 'window.zidData' in script.string:
-                data = extract_json_object(script.string, 'window.zidData')
-                if data and isinstance(data, dict) and 'product' in data:
-                    target_data = data['product']
-                    break
-            elif 'window.product' in script.string:
-                data = extract_json_object(script.string, 'window.product')
-                if data and isinstance(data, dict):
-                    target_data = data
-                    break
+            if script.string and 'window.dataLayer' in script.string and 'ecommerce' in script.string:
+                try:
+                    json_text = script.string.split('window.dataLayer.push(')[1].split(');')[0]
+                    data = json.loads(json_text)
+                    if 'ecommerce' in data and 'detail' in data['ecommerce']:
+                        prod_data = data['ecommerce']['detail']['products'][0]
+                        prod_name = prod_data.get('name', '')
+                        sku = str(prod_data.get('id', sku))
+                        prod_price = float(prod_data.get('price', 0))
+                        raw_categories = prod_data.get('categories', [])
+                        product_categories = [c.get('name', '') for c in raw_categories if isinstance(c, dict)]
+                        found_in_json = True
+                        break
+                except: pass
 
-        if target_data:
-            base_name = target_data.get('name', '')
+        # المحاولة الثانية (خط الدفاع البديل): إذا فشل الـ JSON، نسحب علناً من الـ HTML
+        if not found_in_json or not prod_name:
+            # التقاط الاسم من عنوان الصفحة أو وسم h1
+            name_meta = soup.find("meta", property="og:title")
+            prod_name = name_meta["content"] if name_meta else (soup.find("h1").text.strip() if soup.find("h1") else "")
+            
+            # التقاط السعر من الـ Meta tags
+            price_meta = soup.find("meta", property="product:price:amount")
+            if price_meta:
+                prod_price = float(price_meta["content"])
+            
+            # التقاط التصنيفات من كسر الخبز (Breadcrumbs) المشهور في سلة
+            breadcrumbs = soup.find_all('li', class_='breadcrumb-item')
+            if breadcrumbs:
+                product_categories = [b.text.strip() for b in breadcrumbs if b.text.strip()]
 
-            raw_categories = target_data.get('categories', [])
-            product_categories = []
-            if isinstance(raw_categories, list):
-                for c in raw_categories:
-                    if isinstance(c, dict) and 'name' in c: product_categories.append(c['name'])
-                    elif isinstance(c, str): product_categories.append(c)
-
-            if not validate_product(base_name, product_categories, include_kws, include_cats, exclude_cats):
-                return local_data
-
-            detected_cat_str = " / ".join(product_categories) if product_categories else "غير محدد"
-            variants = target_data.get('variants', [])
-
-            backup_image = target_data.get('image', '')
-            if backup_image and not backup_image.startswith('http'):
-                backup_image = "https://cdn.zid.store/" + backup_image
-
-            resolved_image = final_image_url or backup_image
-
-            if isinstance(variants, list) and len(variants) > 0:
-                for variant in variants:
-                    if not isinstance(variant, dict): continue
-                    v_price = variant.get('sale_price') or variant.get('price') or 0
-                    v_stock = variant.get('stock') if variant.get('stock') is not None else variant.get('quantity', 0)
-                    local_data.append({
-                        'store_id': store_id,
-                        'sku': str(variant.get('sku') or variant.get('id', '')),
-                        'product_name': variant.get('name') or base_name,
-                        'price': float(v_price) if v_price else 0.0,
-                        'quantity': int(v_stock) if v_stock else 0,
-                        'product_url': url,
-                        'main_image': resolved_image,
-                        'detected_category': detected_cat_str
-                    })
-            else:
-                price = target_data.get('sale_price') or target_data.get('price') or 0
-                stock = target_data.get('stock') if target_data.get('stock') is not None else target_data.get('quantity', 0)
+        # التحقق النهائي والضخ إذا انطبقت الشروط
+        if prod_name:
+            if validate_product(prod_name, product_categories, include_kws, include_cats, exclude_cats):
                 local_data.append({
                     'store_id': store_id,
-                    'sku': str(target_data.get('sku', '')),
-                    'product_name': base_name,
-                    'price': float(price) if price else 0.0,
-                    'quantity': int(stock) if stock else 0,
+                    'product_name': prod_name,
+                    'sku': sku,
+                    'price': prod_price,
+                    'quantity': 10, # قيمة افتراضية إذا لم تتوفر في الواجهة لحين التحديث
                     'product_url': url,
-                    'main_image': resolved_image,
-                    'detected_category': detected_cat_str
+                    'main_image': final_image_url,
+                    'detected_category': " / ".join(product_categories) if product_categories else "غير محدد"
                 })
     except Exception:
         pass
