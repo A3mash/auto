@@ -33,7 +33,8 @@ for s in scrapers:
     s.mount('http://', adapter)
     s.mount('https://', adapter)
 
-MAX_WORKERS = 8 
+# تم تقليل العدد إلى 2 لتجنب استفزاز حماية Cloudflare
+MAX_WORKERS = 2 
 
 # ==========================================
 # 2. دوال مساعدة وعمومية
@@ -66,7 +67,7 @@ def get_sitemap_links(sitemap_url, current_device):
             if url.strip('/') == base_url:
                 continue
                 
-            # إذا تجاوز الرابط كل الفلاتر، فهو رابط منتج حتمي (حتى لو كان قصيراً)
+            # إذا تجاوز الرابط كل الفلاتر، فهو رابط منتج حتمي
             filtered_links.append(url)
             
         return list(set(filtered_links))
@@ -132,6 +133,9 @@ def validate_product(product_name, product_categories, include_kws, include_cats
 # 4. دوال سحب المنتج للمنصات (Zid & Salla)
 # ==========================================
 def fetch_single_zid(url, store_id, include_kws, include_cats, exclude_cats):
+    # ⏳ تمويه بشري: توقف عشوائي قبل كل طلب لتجنب الحظر
+    time.sleep(random.uniform(1.5, 4.0))
+    
     local_data = []
     current_device = random.choice(scrapers)
     try:
@@ -211,6 +215,9 @@ def fetch_single_zid(url, store_id, include_kws, include_cats, exclude_cats):
     return local_data
 
 def fetch_single_salla(url, store_id, include_kws, include_cats, exclude_cats):
+    # ⏳ تمويه بشري: توقف عشوائي قبل كل طلب لتجنب الحظر
+    time.sleep(random.uniform(1.5, 4.0))
+    
     local_data = []
     current_device = random.choice(scrapers)
     try:
