@@ -42,12 +42,39 @@ def get_sitemap_links(sitemap_url, current_device):
     try:
         response = current_device.get(sitemap_url, timeout=20)
         soup = BeautifulSoup(response.text, 'xml')
-        links = [loc.text for loc in soup.find_all('loc') if '/products/' in loc.text or '/p/' in loc.text or loc.text.count('/') > 3]
-        return list(set(links))
+        
+        # 1. سحب كافة الروابط الموجودة داخل وسم <loc> دون قيود مسبقة على النص
+        all_links = [loc.text.strip() for loc in soup.find_all('loc') if loc.text]
+        
+        # 2. تصفية الروابط واستبعاد الصفحات الإدارية والعامة فقط لتبقى المنتجات
+        filtered_links = []
+        for url in all_links:
+            # استبعاد الروابط التي تشير إلى ملفات الصور مباشرة (CDN)
+            if 'cdn.salla.sa' in url or url.endswith('.jpg') or url.endswith('.png'):
+                continue
+                
+            # استبعاد روابط الصفحات التعريفية العامة والعربة والتصنيفات
+            excluded_patterns = [
+                '/categories', '/tags', '/pages', '/blog', '/cart', 
+                '/shipping', '/privacy', '/about', '/contact', '/search'
+            ]
+            if any(pattern in url for pattern in excluded_patterns):
+                continue
+                
+            # استبعاد رابط المتجر الرئيسي نفسه (لأنه ليس صفحة منتج)
+            base_url = sitemap_url.replace('/sitemap.xml', '').strip('/')
+            if url.strip('/') == base_url:
+                continue
+                
+            # إذا تجاوز الرابط كل الفلاتر، فهو رابط منتج حتمي (حتى لو كان قصيراً)
+            filtered_links.append(url)
+            
+        return list(set(filtered_links))
     except Exception:
         return []
 
 def extract_json_object(text, start_keyword):
+    """الدالة المسترجعة لفك تشفير مصفوفات واجهات المتاجر بدقة وعزل الـ JSON"""
     idx = text.find(start_keyword)
     if idx == -1: return None
     start_idx = text.find('{', idx)
