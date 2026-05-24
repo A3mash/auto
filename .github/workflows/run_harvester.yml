@@ -2,9 +2,8 @@ name: Automated Inventory Harvester Engine
 
 on:
   schedule:
-    # يشتغل تلقائياً كل 6 ساعات
     - cron: '0 */6 * * *'
-  workflow_dispatch: # يسمح لك بالتشغيل اليدوي الفوري بضغطة زر
+  workflow_dispatch:
 
 jobs:
   run-scraper:
@@ -12,10 +11,10 @@ jobs:
 
     steps:
     - name: Clone Repository Data
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set Up Python Environment
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.12'
 
