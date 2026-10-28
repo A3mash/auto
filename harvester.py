@@ -1,371 +1,154 @@
-import os
-import json
-import time
-import random
-import requests
-import cloudscraper
+"""محرّك الحصاد: يمرّ على المتاجر المفعّلة في stores_config ويكتب live_inventory.
+
+سجل التغيّرات (inventory_history) تكتبه القاعدة نفسها عند تغيّر السعر/الكمية، لا هذا الملف.
+
+التشغيل:
+  python harvester.py                       # كل المتاجر المفعّلة، مع الكتابة
+  python harvester.py --dry-run --store 5   # متجر واحد بلا كتابة (للتجربة)
+  python harvester.py --store 6 --include-inactive --dry-run
+"""
+import argparse
 import concurrent.futures
-from bs4 import BeautifulSoup
-from supabase import create_client, Client
+import os
+import sys
+from datetime import datetime, timezone
 
-# ==========================================
-# 1. إعدادات النظام والاتصال
-# ==========================================
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+from supabase import Client, create_client
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("⚠️ خطأ: لم يتم العثور على مفاتيح الاتصال بـ Supabase في البيئة السحابية.")
+import salla
+import zid
+from common import base_url_of, crawl_sitemap, filter_product_links
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+MAX_WORKERS = 2  # Zid: عاملان فقط لتجنّب استفزاز حماية Cloudflare
+BATCH_SIZE = 500
+CORE_COLUMNS = {'store_id', 'sku', 'product_name', 'price', 'quantity', 'product_url',
+                'main_image', 'detected_category', 'last_updated'}
+# أعمدة تضيفها الهجرة 001 في مستودع AshhabRadar؛ تُرسَل فقط إن وُجدت في القاعدة
+OPTIONAL_COLUMNS = ['quantity_source', 'platform_product_id', 'sold_count']
 
-print("🛠️ جاري تجهيز ترسانة الأجهزة الوهمية...")
-scrapers = [
-    cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}),
-    cloudscraper.create_scraper(browser={'browser': 'firefox', 'platform': 'windows', 'desktop': True}),
-    cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'darwin', 'desktop': True}),
-    cloudscraper.create_scraper(browser={'browser': 'firefox', 'platform': 'darwin', 'desktop': True}),
-    cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'linux', 'desktop': True})
-]
 
-for s in scrapers:
-    adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50)
-    s.mount('http://', adapter)
-    s.mount('https://', adapter)
+def connect():
+    url, key = os.environ.get('SUPABASE_URL'), os.environ.get('SUPABASE_KEY')
+    if not url or not key:
+        raise ValueError('⚠️ خطأ: لم يتم العثور على مفاتيح الاتصال بـ Supabase في البيئة السحابية.')
+    return create_client(url, key)
 
-# تم تقليل العدد إلى 2 لتجنب استفزاز حماية Cloudflare
-MAX_WORKERS = 2 
 
-# ==========================================
-# 2. دوال مساعدة وعمومية
-# ==========================================
-def get_sitemap_links(sitemap_url, current_device):
-    try:
-        response = current_device.get(sitemap_url, timeout=20)
-        soup = BeautifulSoup(response.text, 'xml')
-        
-        # 1. سحب كافة الروابط الموجودة داخل وسم <loc> دون قيود مسبقة على النص
-        all_links = [loc.text.strip() for loc in soup.find_all('loc') if loc.text]
-        
-        # 2. تصفية الروابط واستبعاد الصفحات الإدارية والعامة فقط لتبقى المنتجات
-        filtered_links = []
-        for url in all_links:
-            # استبعاد الروابط التي تشير إلى ملفات الصور مباشرة (CDN)
-            if 'cdn.salla.sa' in url or url.endswith('.jpg') or url.endswith('.png'):
-                continue
-                
-            # استبعاد روابط الصفحات التعريفية العامة والعربة والتصنيفات
-            excluded_patterns = [
-                '/categories', '/tags', '/pages', '/blog', '/cart', 
-                '/shipping', '/privacy', '/about', '/contact', '/search'
-            ]
-            if any(pattern in url for pattern in excluded_patterns):
-                continue
-                
-            # استبعاد رابط المتجر الرئيسي نفسه (لأنه ليس صفحة منتج)
-            base_url = sitemap_url.replace('/sitemap.xml', '').strip('/')
-            if url.strip('/') == base_url:
-                continue
-                
-            # إذا تجاوز الرابط كل الفلاتر، فهو رابط منتج حتمي
-            filtered_links.append(url)
-            
-        return list(set(filtered_links))
-    except Exception:
-        return []
+def available_optional_columns(db: Client):
+    cols = []
+    for col in OPTIONAL_COLUMNS:
+        try:
+            db.table('live_inventory').select(col).limit(1).execute()
+            cols.append(col)
+        except Exception:
+            pass
+    return cols
 
-def extract_json_object(text, start_keyword):
-    """الدالة المسترجعة لفك تشفير مصفوفات واجهات المتاجر بدقة وعزل الـ JSON"""
-    idx = text.find(start_keyword)
-    if idx == -1: return None
-    start_idx = text.find('{', idx)
-    if start_idx == -1: return None
-    
-    brace_count = 0
-    in_string = False
-    escape = False
-    for i in range(start_idx, len(text)):
-        char = text[i]
-        if escape: escape = False; continue
-        if char == '\\': escape = True; continue
-        if char == '"': in_string = not in_string; continue
-        if not in_string:
-            if char == '{': brace_count += 1
-            elif char == '}': brace_count -= 1
-            if brace_count == 0:
-                try: return json.loads(text[start_idx:i+1])
-                except: return None
-    return None
 
-# ==========================================
-# 3. محرك الفلترة الذكي (ثلاثي الأبعاد)
-# ==========================================
-def validate_product(product_name, product_categories, include_kws, include_cats, exclude_cats):
-    name_lower = product_name.lower()
-    cats_lower = [c.lower() for c in product_categories]
-    
-    if exclude_cats:
-        if any(ex_cat.lower() in cat for cat in cats_lower for ex_cat in exclude_cats):
-            return False
+def harvest_zid(store_id, sitemap_url, rules):
+    pages, sitemaps = crawl_sitemap(sitemap_url)
+    links = filter_product_links(pages, base_url_of(sitemap_url))
+    print(f"   🗺️ {len(sitemaps)} ملف خريطة → {len(links)} رابط")
+    rows, done = [], 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for result in ex.map(lambda u: zid.fetch_product(u, store_id, rules), links):
+            rows.extend(result)
+            done += 1
+            if done % 100 == 0 or done == len(links):
+                print(f"   🔄 [{done}/{len(links)}]")
+    return rows
 
-    if not include_kws and not include_cats:
-        return True
 
-    passed_kw = False
-    passed_cat = False
+def dedupe(rows):
+    """مفتاح التعارض (store_id, sku). تكرار SKU التاجر بين منتجين مختلفين في سلة لا يُسقط أحدهما:
+    يُميَّز الثاني بمعرّف منتجه. غير ذلك: آخر صف يفوز، كما كان."""
+    out = {}
+    for r in rows:
+        key = (r['store_id'], r['sku'])
+        prev = out.get(key)
+        if prev and r.get('platform_product_id') and prev.get('platform_product_id') != r['platform_product_id']:
+            r = {**r, 'sku': f"{r['sku']}-{r['platform_product_id']}"}
+            key = (r['store_id'], r['sku'])
+        out[key] = r
+    return list(out.values())
 
-    if include_kws:
-        passed_kw = any(kw.lower() in name_lower for kw in include_kws)
 
-    if include_cats:
-        passed_cat = any(inc_cat.lower() in cat for cat in cats_lower for inc_cat in include_cats)
+def write_rows(db, rows, allowed_columns):
+    for i in range(0, len(rows), BATCH_SIZE):
+        batch = [{k: v for k, v in r.items() if k in allowed_columns} for r in rows[i:i + BATCH_SIZE]]
+        db.table('live_inventory').upsert(batch, on_conflict='store_id,sku').execute()
 
-    if include_kws and include_cats:
-        return passed_kw or passed_cat
-    elif include_kws:
-        return passed_kw
-    elif include_cats:
-        return passed_cat
 
-    return False
-
-# ==========================================
-# 4. دوال سحب المنتج للمنصات (Zid & Salla)
-# ==========================================
-def fetch_single_zid(url, store_id, include_kws, include_cats, exclude_cats):
-    # ⏳ تمويه بشري: توقف عشوائي قبل كل طلب لتجنب الحظر
-    time.sleep(random.uniform(1.5, 4.0))
-    
-    local_data = []
-    current_device = random.choice(scrapers)
-    try:
-        response = current_device.get(url, timeout=15)
-        if response.status_code != 200: return local_data
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        og_image = soup.find("meta", property="og:image")
-        final_image_url = og_image["content"] if og_image and og_image.has_attr("content") else ""
-
-        target_data = None
-        for script in soup.find_all('script'):
-            if not script.string: continue
-            if 'window.zidData' in script.string:
-                data = extract_json_object(script.string, 'window.zidData')
-                if data and isinstance(data, dict) and 'product' in data:
-                    target_data = data['product']
-                    break
-            elif 'window.product' in script.string:
-                data = extract_json_object(script.string, 'window.product')
-                if data and isinstance(data, dict):
-                    target_data = data
-                    break
-        
-        if target_data:
-            base_name = target_data.get('name', '')
-            raw_categories = target_data.get('categories', [])
-            product_categories = []
-            if isinstance(raw_categories, list):
-                for c in raw_categories:
-                    if isinstance(c, dict) and 'name' in c: product_categories.append(c['name'])
-                    elif isinstance(c, str): product_categories.append(c)
-
-            if not validate_product(base_name, product_categories, include_kws, include_cats, exclude_cats):
-                return local_data
-                
-            detected_cat_str = " / ".join(product_categories) if product_categories else "غير محدد"
-            variants = target_data.get('variants', [])
-            
-            backup_image = target_data.get('image', '')
-            if backup_image and not backup_image.startswith('http'):
-                backup_image = "https://cdn.zid.store/" + backup_image
-                
-            resolved_image = final_image_url or backup_image
-
-            if isinstance(variants, list) and len(variants) > 0:
-                for variant in variants:
-                    if not isinstance(variant, dict): continue
-                    v_price = variant.get('sale_price') or variant.get('price') or 0
-                    v_stock = variant.get('stock') if variant.get('stock') is not None else variant.get('quantity', 0)
-                    local_data.append({
-                        'store_id': store_id,
-                        'sku': str(variant.get('sku') or variant.get('id', '')),
-                        'product_name': variant.get('name') or base_name,
-                        'price': float(v_price) if v_price else 0.0,
-                        'quantity': int(v_stock) if v_stock else 0,
-                        'product_url': url,
-                        'main_image': resolved_image,
-                        'detected_category': detected_cat_str
-                    })
-            else:
-                price = target_data.get('sale_price') or target_data.get('price') or 0
-                stock = target_data.get('stock') if target_data.get('stock') is not None else target_data.get('quantity', 0)
-                local_data.append({
-                    'store_id': store_id,
-                    'sku': str(target_data.get('sku', '')),
-                    'product_name': base_name,
-                    'price': float(price) if price else 0.0,
-                    'quantity': int(stock) if stock else 0,
-                    'product_url': url,
-                    'main_image': resolved_image,
-                    'detected_category': detected_cat_str
-                })
-    except Exception:
-        pass
-    return local_data
-
-def fetch_single_salla(url, store_id, include_kws, include_cats, exclude_cats):
-    # ⏳ تمويه بشري: توقف عشوائي قبل كل طلب لتجنب الحظر
-    time.sleep(random.uniform(1.5, 4.0))
-    
-    local_data = []
-    current_device = random.choice(scrapers)
-    try:
-        response = current_device.get(url, timeout=15)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        og_image = soup.find("meta", property="og:image")
-        final_image_url = og_image["content"] if og_image and og_image.has_attr("content") else ""
-
-        prod_name = ""
-        prod_price = 0.0
-        product_categories = []
-        sku = url.split('/')[-1]
-
-        found_in_json = False
-        for script in soup.find_all('script'):
-            if script.string and 'window.dataLayer' in script.string and 'ecommerce' in script.string:
-                try:
-                    json_text = script.string.split('window.dataLayer.push(')[1].split(');')[0]
-                    data = json.loads(json_text)
-                    if 'ecommerce' in data and 'detail' in data['ecommerce']:
-                        prod_data = data['ecommerce']['detail']['products'][0]
-                        prod_name = prod_data.get('name', '')
-                        sku = str(prod_data.get('id', sku))
-                        prod_price = float(prod_data.get('price', 0))
-                        raw_categories = prod_data.get('categories', [])
-                        product_categories = [c.get('name', '') for c in raw_categories if isinstance(c, dict)]
-                        found_in_json = True
-                        break
-                except: pass
-
-        if not found_in_json or not prod_name:
-            name_meta = soup.find("meta", property="og:title")
-            prod_name = name_meta["content"] if name_meta else (soup.find("h1").text.strip() if soup.find("h1") else "")
-            
-            price_meta = soup.find("meta", property="product:price:amount")
-            if price_meta:
-                prod_price = float(price_meta["content"])
-            
-            breadcrumbs = soup.find_all('li', class_='breadcrumb-item')
-            if breadcrumbs:
-                product_categories = [b.text.strip() for b in breadcrumbs if b.text.strip()]
-
-        if prod_name:
-            if validate_product(prod_name, product_categories, include_kws, include_cats, exclude_cats):
-                local_data.append({
-                    'store_id': store_id,
-                    'product_name': prod_name,
-                    'sku': sku,
-                    'price': prod_price,
-                    'quantity': 10,
-                    'product_url': url,
-                    'main_image': final_image_url,
-                    'detected_category': " / ".join(product_categories) if product_categories else "غير محدد"
-                })
-    except Exception:
-        pass
-    return local_data
-
-# ==========================================
-# 5. الموجه والمنسق المتوازي
-# ==========================================
-def run_concurrent_harvest(platform, store_id, sitemap_url, include_kws, include_cats, exclude_cats):
-    product_links = get_sitemap_links(sitemap_url, scrapers[0])
-    harvested_data = []
-    
-    if not product_links:
-        return harvested_data
-
-    print(f"⚡ بدء المعالجة المتوازية لـ {len(product_links)} رابط...")
-    target_func = fetch_single_zid if platform == 'zid' else fetch_single_salla
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(target_func, url, store_id, include_kws, include_cats, exclude_cats): url for url in product_links}
-        
-        completed = 0
-        for future in concurrent.futures.as_completed(futures):
-            completed += 1
-            result = future.result()
-            if result:
-                harvested_data.extend(result)
-            
-            if completed % 100 == 0 or completed == len(product_links):
-                print(f"🔄 تمت معالجة [{completed}/{len(product_links)}] رابط...")
-
-    return harvested_data
-
-# ==========================================
-# 6. الدورة الرئيسية (Main)
-# ==========================================
 def main():
-    print("🚀 بدء تشغيل محرك الحصاد الذكي (نسخة الإطلاق النهائية)...\n")
-    response = supabase.table("stores_config").select("*").eq("is_active", True).order('id').execute()
-    active_stores = response.data
-    
-    if not active_stores:
-        print("⚠️ لا توجد متاجر مفعلة في النظام.")
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--store', type=int, action='append', help='معرّف متجر (يتكرّر)')
+    ap.add_argument('--dry-run', action='store_true', help='اجمع واطبع دون الكتابة في القاعدة')
+    ap.add_argument('--include-inactive', action='store_true', help='اسمح بمتاجر is_active = false')
+    args = ap.parse_args()
+
+    db = connect()
+    print('🚀 بدء تشغيل محرك الحصاد' + (' (تجربة بلا كتابة)' if args.dry_run else '') + '\n')
+
+    q = db.table('stores_config').select('*').order('id')
+    if not args.include_inactive:
+        q = q.eq('is_active', True)
+    if args.store:
+        q = q.in_('id', args.store)
+    stores = q.execute().data
+    if not stores:
+        print('⚠️ لا توجد متاجر مطابقة.')
         return
 
-    for store in active_stores:
-        store_id = store['id']
-        platform = store['platform'].lower()
-        sitemap_url = store['sitemap_url']
-        store_name = store.get('store_name', 'غير معروف')
-        
-        print(f"\n" + "="*50)
-        print(f"⚙️ معالجة متجر: {store_name} (رقم: {store_id})")
-        print("="*50)
-        
-        rules_response = supabase.table("store_rules").select("*").eq("store_id", store_id).execute()
-        rules = rules_response.data
-        
-        include_kws = [r['value'].strip() for r in rules if r['rule_type'] == 'INCLUDE_KEYWORD']
-        include_cats = [r['value'].strip() for r in rules if r['rule_type'] == 'INCLUDE_CATEGORY']
-        exclude_cats = [r['value'].strip() for r in rules if r['rule_type'] == 'EXCLUDE_CATEGORY']
-        
-        if not include_kws and not include_cats and not exclude_cats:
-            print("📋 وضع الحصاد: شامل وعام (سحب كامل المخزون)")
-        else:
-            if include_kws: print(f"🔍 فلاتر الاسم: {include_kws}")
-            if include_cats: print(f"📂 فلاتر التصنيف المطلوبة: {include_cats}")
-            if exclude_cats: print(f"🛑 فلاتر التصنيف المستبعدة: {exclude_cats}")
-        
-        if platform in ['zid', 'salla']:
-            products = run_concurrent_harvest(platform, store_id, sitemap_url, include_kws, include_cats, exclude_cats)
-            print(f"🎯 الحصيلة المقبولة والمطابقة: {len(products)} منتج.")
-            
-            if products:
-                unique_products_dict = {}
-                for p in products:
-                    unique_key = f"{p['store_id']}_{p['sku']}"
-                    unique_products_dict[unique_key] = p 
-                
-                clean_products = list(unique_products_dict.values())
-                
-                print(f"📦 جاري ضخ بيانات متجر ({store_name}) ({len(clean_products)} منتج فريد) إلى Supabase...")
-                batch_size = 500
-                for i in range(0, len(clean_products), batch_size):
-                    batch = clean_products[i:i+batch_size]
-                    supabase.table("live_inventory").upsert(batch, on_conflict="store_id,sku").execute()
-                print(f"✅ تم رفع بيانات متجر ({store_name}) بنجاح! ننتقل للمتجر التالي...")
+    allowed = CORE_COLUMNS | set(available_optional_columns(db))
+    missing_opt = [c for c in OPTIONAL_COLUMNS if c not in allowed]
+    if missing_opt:
+        print(f"ℹ️ أعمدة غير موجودة بعد في live_inventory (طبّق الهجرة 001): {missing_opt}")
+
+    failures = []
+    for store in stores:
+        store_id, platform = store['id'], (store['platform'] or '').lower()
+        name = store.get('store_name', 'غير معروف')
+        print('\n' + '=' * 50 + f"\n⚙️ متجر: {name} (رقم {store_id}، {platform})\n" + '=' * 50)
+
+        rules_rows = db.table('store_rules').select('*').eq('store_id', store_id).order('id').execute().data
+        rules = tuple([r['value'].strip() for r in rules_rows if r['rule_type'] == t]
+                      for t in ('INCLUDE_KEYWORD', 'INCLUDE_CATEGORY', 'EXCLUDE_CATEGORY'))
+        if any(rules):
+            print(f"   🔍 كلمات: {rules[0]} · تصنيفات مطلوبة: {rules[1]} · مستبعدة: {rules[2]}")
+
+        started = datetime.now(timezone.utc).isoformat()
+        try:
+            if platform == 'zid':
+                rows = harvest_zid(store_id, store['sitemap_url'], rules)
+            elif platform == 'salla':
+                rows = salla.harvest_store(store_id, store['sitemap_url'], rules)
             else:
-                print(f"📭 لم يتم العثور على منتجات مطابقة في متجر ({store_name}).")
-                
-        else:
-            print(f"⚠️ منصة غير مدعومة: {platform}")
+                print(f"⚠️ منصة غير مدعومة: {platform}")
+                continue
+        except Exception as e:  # متجر معطوب لا يوقف البقية
+            print(f"❌ فشل المتجر {name}: {e!r}")
+            failures.append(name)
+            continue
 
-    print("\n🎉 تم الانتهاء من جميع المتاجر وتحديث المخزون الحي بنجاح تام!")
+        rows = dedupe(rows)
+        # D3: بصمة كل تمريرة — حتى لو لم يتغيّر السعر ولا الكمية
+        for r in rows:
+            r['last_updated'] = started
+        print(f"🎯 {len(rows)} صف فريد")
+        if not rows:
+            print(f"📭 لا منتجات من ({name}) — لن يُمسّ مخزونه الحالي.")
+            continue
+        if args.dry_run:
+            for r in rows[:5]:
+                print('   •', {k: r.get(k) for k in ('sku', 'product_name', 'price', 'quantity', 'quantity_source')})
+            continue
+        write_rows(db, rows, allowed)
+        print(f"✅ رُفع ({name})")
 
-if __name__ == "__main__":
+    print('\n🎉 انتهى.' + (f" متاجر فشلت: {failures}" if failures else ''))
+    if failures:
+        sys.exit(1)
+
+
+if __name__ == '__main__':
     main()
