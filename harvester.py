@@ -46,7 +46,7 @@ def available_optional_columns(db: Client):
 
 
 def harvest_zid(store_id, sitemap_url, rules):
-    pages, sitemaps = crawl_sitemap(sitemap_url)
+    pages, sitemaps = crawl_sitemap(sitemap_url, log=print)
     links = filter_product_links(pages, base_url_of(sitemap_url))
     print(f"   🗺️ {len(sitemaps)} ملف خريطة → {len(links)} رابط")
     rows, done = [], 0

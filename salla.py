@@ -265,13 +265,16 @@ class SallaStore:
         roots = [self.base + '/sitemap.xml']
         if self.sitemap_url and self.sitemap_url.rstrip('/') not in [r.rstrip('/') for r in roots]:
             roots.append(self.sitemap_url.replace('.com//', '.com/'))
-        found = {}
+        found, all_pages = {}, []
         for root in roots:
-            pages, _ = crawl_sitemap(root)
+            pages, _ = crawl_sitemap(root, log=self.log)
+            all_pages += pages
             for url in filter_product_links(pages, self.base):
                 pid = product_id_from_url(url)
                 if pid:
                     found.setdefault(pid, url)
+        if all_pages and not found:
+            self.log(f"   ⚠️ لا معرّف /p{{id}} في {len(all_pages)} رابط، أمثلة: {all_pages[:3]}")
         self.stats['sitemap_ids'] = len(found)
         return found
 
@@ -400,6 +403,12 @@ class SallaStore:
                     if p:
                         products[pid] = p
 
+        sample = next(iter(products.values()), None)
+        if sample:
+            keys = ('quantity', 'stock_quantity', 'status', 'is_available', 'is_out_of_stock',
+                    'unlimited_quantity', 'max_quantity', 'sold_quantity', 'sku')
+            self.log(f"   🧪 عيّنة خام: { {k: sample.get(k) for k in keys} } · المفاتيح: {sorted(sample)[:40]}")
+
         rows = []
         for pid, p in products.items():
             if not self._passes(p):
@@ -408,7 +417,8 @@ class SallaStore:
             for row in product_to_rows(p, self.store_id, sitemap.get(pid)):
                 self.stats[row['quantity_source']] += 1
                 rows.append(row)
-        self.log(f"   📊 {self.stats}")
+        q = [r['quantity'] for r in rows]
+        self.log(f"   📊 {self.stats} · الكميات: صفر={q.count(0)} · واحد={q.count(1)} · أكثر={sum(x > 1 for x in q)}")
         return rows
 
 

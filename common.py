@@ -64,7 +64,7 @@ EXCLUDED_PATTERNS = [
 _SALLA_CATEGORY = re.compile(r'/c\d+/?$')
 
 
-def crawl_sitemap(sitemap_url, *, max_sitemaps=200):
+def crawl_sitemap(sitemap_url, *, max_sitemaps=200, log=None):
     """يجمع كل روابط <loc> من الخريطة، ويتبع فهارس <sitemapindex> إلى نهايتها.
 
     يُعيد (روابط الصفحات، الخرائط التي قُرئت). الخريطة القديمة كانت تُقرأ كملف واحد،
@@ -78,12 +78,17 @@ def crawl_sitemap(sitemap_url, *, max_sitemaps=200):
         seen.add(url)
         r = polite_get(url, device=scrapers[0])
         if r is None or r.status_code != 200:
+            if log:
+                log(f"   ⚠️ خريطة {url} → {'لا رد' if r is None else r.status_code}")
             continue
         soup = BeautifulSoup(r.content, 'xml')
+        locs = [loc.text.strip() for loc in soup.find_all('loc') if loc.text]
         if soup.find('sitemapindex'):
-            queue.extend(loc.text.strip() for loc in soup.select('sitemap > loc') if loc.text)
+            queue.extend(locs)
         else:
-            pages.extend(loc.text.strip() for loc in soup.select('url > loc') if loc.text)
+            pages.extend(locs)
+        if log:
+            log(f"   🗺️ {url} → {len(locs)} رابط{' (فهرس)' if soup.find('sitemapindex') else ''}")
     return pages, sorted(seen)
 
 
