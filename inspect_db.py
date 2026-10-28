@@ -136,6 +136,9 @@ def main():
     for sid in sorted({r['store_id'] for r in live}):
         q = [r['quantity'] for r in live if r['store_id'] == sid]
         print(f"  متجر {sid}: صفوف={len(q)} صفر={q.count(0)} عشرة={q.count(10)} توزيع شائع={Counter(q).most_common(5)}")
+    for sid in sorted({r['store_id'] for r in live}):
+        ss = [r['sku'] for r in live if r['store_id'] == sid]
+        print(f"  متجر {sid}: أمثلة SKU={ss[:4]} · رقمية بالكامل={sum(x.isdigit() for x in ss)}/{len(ss)}")
     skus = Counter(r['sku'] for r in live)
     shared = [s for s, n in skus.items() if n > 1]
     print(f"  SKU مشترك بين أكثر من متجر: {len(shared)} · منها هزيل: {sum(1 for s in shared if len(s) <= 4)}")

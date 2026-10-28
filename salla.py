@@ -196,13 +196,14 @@ def product_to_rows(p, store_id, fallback_url=None, use_max=False):
                 str(o.get('value') or o.get('name')) for o in (v.get('options') or v.get('related_options') or [])
                 if isinstance(o, dict)) or str(v['id'])
             rows.append({**base,
-                         'sku': clean_sku(v.get('sku'), f"salla-{pid}-{v['id']}"),
+                         'sku': clean_sku(v.get('sku'), f"{pid}-{v['id']}"),
                          'product_name': f"{name} - {label}" if label and label not in name else name,
                          'price': _price(v) or base['price'],
                          'quantity': vq if vq is not None else base['quantity'],
                          'quantity_source': vs or base['quantity_source']})
         return rows
-    return [{**base, 'sku': clean_sku(p.get('sku'), f'salla-{pid}')}]
+    # بلا SKU تاجر: معرّف المنتج نفسه، كما كان المحرّك القديم يكتبه (dataLayer id)، فيبقى التاريخ موصولاً
+    return [{**base, 'sku': clean_sku(p.get('sku'), pid)}]
 
 
 # ==========================================

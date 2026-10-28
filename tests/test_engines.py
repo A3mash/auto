@@ -17,7 +17,8 @@ class CommonTests(unittest.TestCase):
     def test_clean_sku_rejects_junk(self):
         self.assertEqual(clean_sku('_', 'fb'), 'fb')
         self.assertEqual(clean_sku('  ', 'fb'), 'fb')
-        self.assertEqual(clean_sku('123', 'fb'), 'fb')
+        self.assertEqual(clean_sku('0', 'fb'), 'fb')
+        self.assertEqual(clean_sku('123', 'fb'), '123')  # قصير لكنه مفتاح حقيقي في متجره
         self.assertEqual(clean_sku('11289-62020', 'fb'), '11289-62020')
         self.assertEqual(clean_sku('48510', 'fb'), '48510')
 
@@ -66,7 +67,7 @@ class SallaParsingTests(unittest.TestCase):
              'is_on_sale': True, 'quantity': 3, 'image': {'url': 'i.jpg'}, 'url': 'u',
              'categories': [{'name': 'إنارة'}], 'sold_quantity': 12}
         [row] = salla.product_to_rows(p, 5)
-        self.assertEqual(row['sku'], 'salla-55')
+        self.assertEqual(row['sku'], '55')
         self.assertEqual((row['price'], row['quantity'], row['quantity_source']), (150, 3, 'exact'))
         self.assertEqual((row['detected_category'], row['sold_count']), ('إنارة', 12))
 
@@ -75,7 +76,7 @@ class SallaParsingTests(unittest.TestCase):
             {'id': 1, 'sku': 'K-RED', 'price': 100, 'quantity': 2, 'name': 'أحمر'},
             {'id': 2, 'sku': '', 'price': 120, 'quantity': 0, 'name': 'أسود'}]}
         rows = salla.product_to_rows(p, 5)
-        self.assertEqual([r['sku'] for r in rows], ['K-RED', 'salla-9-2'])
+        self.assertEqual([r['sku'] for r in rows], ['K-RED', '9-2'])
         self.assertEqual([r['quantity'] for r in rows], [2, 0])
         self.assertEqual(rows[1]['product_name'], 'كفر - أسود')
 
