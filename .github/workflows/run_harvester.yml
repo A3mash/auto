@@ -17,6 +17,10 @@ on:
         description: 'اسمح بمتجر معطّل (للتجربة)'
         type: boolean
         default: false
+      inspect_db:
+        description: 'فحص القاعدة فقط (قراءة) بدل الحصاد'
+        type: boolean
+        default: false
 
 concurrency:
   group: harvester
@@ -47,7 +51,15 @@ jobs:
     - name: Offline tests
       run: python -m unittest discover -s tests -v
 
+    - name: Inspect Database (read-only)
+      if: ${{ inputs.inspect_db }}
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      run: python -u inspect_db.py
+
     - name: Execute Harvesting Engine
+      if: ${{ !inputs.inspect_db }}
       env:
         SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
