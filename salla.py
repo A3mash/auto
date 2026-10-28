@@ -16,13 +16,16 @@
 
 مصدر الكمية يُوسَم في quantity_source:
   exact         الكمية الحقيقية من المتجر.
-  availability  المتجر يُخفي الكمية: 1 = متوفّر، 0 = نافد. البيع يُرصَد عند النفاد فقط (حدّ أدنى).
+  max_quantity  المتجر يُخفي الكمية (سلة تُعيد -1) لكن سقف السلة يتغيّر بين المنتجات، فهو
+                min(المخزون، حدّ الطلب): تقدير يهبط مع كل بيع ما دام المخزون تحت حدّ الطلب.
+  availability  لا كمية ولا سقف مفيد: 1 = متوفّر، 0 = نافد. البيع يُرصَد عند النفاد فقط (حدّ أدنى).
 """
 import concurrent.futures
 import json
 import random
 import re
 import time
+from urllib.parse import unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -52,6 +55,12 @@ _SOLD_KEYS = ('sold_quantity', 'sales_count', 'sold_count')
 def product_id_from_url(url):
     m = _PRODUCT_ID_IN_URL.search(url or '')
     return m.group(1) if m else None
+
+
+def normalize_url(url):
+    """رابط بلا نطاق ولا بادئة لغة ولا ترميز، لمطابقة روابط الخريطة بروابط الـAPI."""
+    path = unquote(urlparse(url or '').path).lower().rstrip('/')
+    return re.sub(r'^/(ar|en)(?=/|$)', '', path)
 
 
 def find_store_id_candidates(html):
@@ -107,20 +116,45 @@ def _is_out(p):
             or status in ('out', 'out-of-stock', 'out_of_stock'))
 
 
-def read_quantity(p):
-    """يُعيد (الكمية، المصدر) أو (None, None) إن لم يحمل الكائن أي معلومة مخزون."""
-    unlimited = p.get('unlimited_quantity') or p.get('is_infinite_quantity') or p.get('with_unlimited_quantity')
+def _unlimited(p):
+    return bool(p.get('unlimited_quantity') or p.get('is_infinite_quantity') or p.get('with_unlimited_quantity'))
+
+
+def limited_max(p):
+    """سقف السلة (max_quantity) لمنتج محدود المخزون. سلة لا تسمح بإضافة أكثر من المتبقّي،
+    فحين يُخفي المتجر الكمية يبقى هذا السقف أثراً لها: min(المخزون، حدّ الطلب الواحد)."""
+    if _unlimited(p):
+        return None
+    m = to_int(p.get('max_quantity'))
+    return m if m and m > 0 else None
+
+
+def max_quantity_informative(products):
+    """هل يتتبّع max_quantity المخزون فعلاً؟ إن كان ثابتاً لكل المنتجات فهو حدّ طلب لا مخزون."""
+    values = [m for m in (limited_max(p) for p in products) if m]
+    return len(values) >= 5 and len(set(values)) >= 3
+
+
+def read_quantity(p, use_max=False):
+    """يُعيد (الكمية، المصدر) أو (None, None) إن لم يحمل الكائن أي معلومة مخزون.
+
+    سلة تُعيد quantity = -1 حين يُخفي التاجر الكمية؛ هذا «مجهول» لا «صفر».
+    """
     exact = None
-    if not unlimited:
+    if not _unlimited(p) and not (p.get('is_hidden_quantity') or p.get('is_hidded_quantity')):
         for key in _QTY_KEYS:
-            exact = to_int(p.get(key))
-            if exact is not None:
+            q = to_int(p.get(key))
+            if q is not None and q >= 0:
+                exact = q
                 break
+    estimated = limited_max(p) if use_max and exact is None else None
     if _is_out(p):
-        return 0, 'exact' if exact is not None else 'availability'
+        return 0, 'exact' if exact is not None else ('max_quantity' if use_max else 'availability')
     if exact is not None:
-        return max(exact, 0), 'exact'
-    if p.get('is_available') is True or unlimited or str(p.get('status') or '').lower() == 'sale':
+        return exact, 'exact'
+    if estimated:
+        return estimated, 'max_quantity'
+    if p.get('is_available') is True or _unlimited(p) or str(p.get('status') or '').lower() == 'sale':
         return 1, 'availability'
     return None, None
 
@@ -133,12 +167,12 @@ def read_sold(p):
     return None
 
 
-def product_to_rows(p, store_id, fallback_url=None):
+def product_to_rows(p, store_id, fallback_url=None, use_max=False):
     pid = str(p.get('id') or '')
     if not pid:
         return []
     name = (p.get('name') or '').strip()
-    qty, source = read_quantity(p)
+    qty, source = read_quantity(p, use_max)
     base = {
         'store_id': store_id,
         'product_name': name,
@@ -157,7 +191,7 @@ def product_to_rows(p, store_id, fallback_url=None):
     if len(variants) >= 2:
         rows = []
         for v in variants:
-            vq, vs = read_quantity(v)
+            vq, vs = read_quantity(v, use_max)
             label = v.get('name') or ' / '.join(
                 str(o.get('value') or o.get('name')) for o in (v.get('options') or v.get('related_options') or [])
                 if isinstance(o, dict)) or str(v['id'])
@@ -192,7 +226,7 @@ class SallaStore:
             'Referer': self.base + '/',
         })
         self.stats = {'listed': 0, 'sitemap_ids': 0, 'details': 0, 'html': 0,
-                      'exact': 0, 'availability': 0, 'filtered_out': 0, 'unknown_category': 0}
+                      'exact': 0, 'max_quantity': 0, 'availability': 0, 'filtered_out': 0, 'unknown_category': 0}
 
     # ---------- الـAPI ----------
     def api(self, path, params=None, identifier=None, absolute=False):
@@ -261,20 +295,17 @@ class SallaStore:
         return products
 
     def sitemap_products(self):
-        """ب-2. فهرس الخرائط الكامل (لا ملف واحد) → {product_id: url}."""
-        roots = [self.base + '/sitemap.xml']
-        if self.sitemap_url and self.sitemap_url.rstrip('/') not in [r.rstrip('/') for r in roots]:
-            roots.append(self.sitemap_url.replace('.com//', '.com/'))
-        found, all_pages = {}, []
-        for root in roots:
-            pages, _ = crawl_sitemap(root, log=self.log)
-            all_pages += pages
-            for url in filter_product_links(pages, self.base):
-                pid = product_id_from_url(url)
-                if pid:
-                    found.setdefault(pid, url)
-        if all_pages and not found:
-            self.log(f"   ⚠️ لا معرّف /p{{id}} في {len(all_pages)} رابط، أمثلة: {all_pages[:3]}")
+        """ب-2. فهرس الخرائط الكامل (لا ملف واحد) → {مفتاح: رابط}.
+
+        المفتاح معرّف المنتج الرقمي إن كان في الرابط (/p123)، وإلا الرابط المُطبَّع
+        (بعض متاجر سلة تستخدم روابط مختصرة بلا معرّف رقمي).
+        """
+        pages, _ = crawl_sitemap(self.base + '/sitemap.xml', log=self.log)
+        if not pages and self.sitemap_url:
+            pages, _ = crawl_sitemap(self.sitemap_url.replace('.com//', '.com/'), log=self.log)
+        found = {}
+        for url in filter_product_links(pages, self.base):
+            found.setdefault(product_id_from_url(url) or 'u:' + normalize_url(url), url)
         self.stats['sitemap_ids'] = len(found)
         return found
 
@@ -363,58 +394,78 @@ class SallaStore:
             return True
         return validate_product(p.get('name', ''), cats, include_kws, include_cats, exclude_cats)
 
+    def _fetch_details(self, products, missing, need_detail):
+        """ج. الإثراء التكيّفي. الغائبون عن القائمة يُطلبون دائماً؛ طلبات الكمية تتوقّف
+        بعد عيّنة إن ثبت أن التفاصيل لا تضيف كمية حقيقية ولا سقف سلة يتتبّع المخزون."""
+        listing_has_max = max_quantity_informative(products.values())
+        queue, stop, done = missing + need_detail, False, []
+        step = DETAIL_WORKERS * 5
+        with concurrent.futures.ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as ex:
+            for i in range(0, len(queue), step):
+                chunk = [pid for pid in queue[i:i + step] if not (stop and pid in products)]
+                for pid, det in zip(chunk, ex.map(self.details, chunk)):
+                    if det:
+                        products[pid] = {**products.get(pid, {}), **det}
+                        done.append(pid)
+                if stop or self.stats['details'] < HIDDEN_QTY_SAMPLE:
+                    continue
+                fetched = [products[p] for p in done]
+                if any(read_quantity(p)[1] == 'exact' for p in fetched):
+                    continue
+                if listing_has_max or not max_quantity_informative(fetched):
+                    stop = True
+                    self.log("   🙈 المتجر يُخفي الكمية والتفاصيل لا تضيف جديداً → إيقاف طلبات التفاصيل")
+
     def harvest(self):
         products = {}
         sitemap = self.sitemap_products()
-        self.log(f"   🗺️ فهرس الخرائط: {len(sitemap)} منتج")
+        self.log(f"   🗺️ فهرس الخرائط: {len(sitemap)} رابط منتج")
 
         if self.discover():
             products = self.list_all()
             self.log(f"   📃 القائمة عبر الـAPI: {len(products)} منتج")
-            missing = [pid for pid in sitemap if pid not in products]
+            api_urls = {normalize_url(p.get('url')) for p in products.values() if p.get('url')}
+            missing = [k for k in sitemap if k not in products and not k.startswith('u:')]
             need_detail = [pid for pid, p in products.items() if read_quantity(p)[1] != 'exact']
             self.log(f"   🔎 تفاصيل مطلوبة: {len(missing)} غائب عن القائمة + {len(need_detail)} بلا كمية")
-
-            # الغائبون عن القائمة يُطلبون دائماً؛ طلبات الكمية تتوقّف إن ثبت أن المتجر يُخفيها
-            hidden_qty = False
-            queue = missing + need_detail
-            with concurrent.futures.ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as ex:
-                for i in range(0, len(queue), DETAIL_WORKERS * 5):
-                    chunk = [pid for pid in queue[i:i + DETAIL_WORKERS * 5]
-                             if not (hidden_qty and pid in products)]
-                    for pid, det in zip(chunk, ex.map(self.details, chunk)):
-                        if det:
-                            products[pid] = {**products.get(pid, {}), **det}
-                    if not hidden_qty and self.stats['details'] >= HIDDEN_QTY_SAMPLE and not any(
-                            read_quantity(products[p])[1] == 'exact' for p in queue[:i + len(chunk)] if p in products):
-                        hidden_qty = True
-                        self.log("   🙈 المتجر يُخفي الكمية → تتبّع التوفّر (متوفّر/نافد) لبقية المنتجات")
-            for pid, url in sitemap.items():
-                if pid in products and not products[pid].get('url'):
-                    products[pid]['url'] = url
-            still_missing = [pid for pid in sitemap if pid not in products]
+            self._fetch_details(products, missing, need_detail)
+            for k, url in sitemap.items():
+                if k in products and not products[k].get('url'):
+                    products[k]['url'] = url
+            still_missing = [k for k in sitemap if k not in products and k[2:] not in api_urls]
         else:
             still_missing = list(sitemap)
 
+        # د. HTML للباقي. سقف أمان: فرق كبير يعني غالباً أن الروابط لم تُطابَق (لا منتجات ناقصة)،
+        # وقراءتها كلها تُكرّر منتجات موجودة بمفاتيح أخرى.
+        if still_missing and products and len(still_missing) > max(30, len(products) // 4):
+            self.log(f"   ⚠️ {len(still_missing)} رابط خريطة بلا مطابق في الـAPI — تُرك دون قراءة HTML. "
+                     f"أمثلة: {[sitemap[k] for k in still_missing[:3]]}")
+            still_missing = []
         if still_missing:
             self.log(f"   🧾 قراءة HTML احتياطية لـ {len(still_missing)} منتج")
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-                for pid, p in zip(still_missing, ex.map(self.html_product, [sitemap[x] for x in still_missing])):
+                for k, p in zip(still_missing, ex.map(self.html_product, [sitemap[x] for x in still_missing])):
                     if p:
-                        products[pid] = p
+                        products[k] = p
 
+        use_max = max_quantity_informative(products.values())
+        if use_max:
+            self.log("   📐 الكمية مخفية لكن سقف السلة (max_quantity) يتغيّر بين المنتجات → يُستخدم تقديراً للمخزون")
         sample = next(iter(products.values()), None)
         if sample:
-            keys = ('quantity', 'stock_quantity', 'status', 'is_available', 'is_out_of_stock',
-                    'unlimited_quantity', 'max_quantity', 'sold_quantity', 'sku')
-            self.log(f"   🧪 عيّنة خام: { {k: sample.get(k) for k in keys} } · المفاتيح: {sorted(sample)[:40]}")
+            keys = ('quantity', 'is_hidden_quantity', 'can_show_remained_quantity', 'status', 'is_available',
+                    'unlimited_quantity', 'max_quantity', 'sold_quantity', 'sku', 'url')
+            self.log(f"   🧪 عيّنة خام: { {k: sample.get(k) for k in keys} }")
+        maxes = sorted({limited_max(p) for p in products.values()} - {None})
+        self.log(f"   🧪 قيم max_quantity المختلفة: {len(maxes)} → {maxes[:15]}")
 
         rows = []
-        for pid, p in products.items():
+        for k, p in products.items():
             if not self._passes(p):
                 self.stats['filtered_out'] += 1
                 continue
-            for row in product_to_rows(p, self.store_id, sitemap.get(pid)):
+            for row in product_to_rows(p, self.store_id, sitemap.get(k), use_max):
                 self.stats[row['quantity_source']] += 1
                 rows.append(row)
         q = [r['quantity'] for r in rows]

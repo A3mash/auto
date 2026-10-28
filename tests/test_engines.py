@@ -45,6 +45,22 @@ class SallaParsingTests(unittest.TestCase):
         self.assertEqual(salla.read_quantity({'quantity': 9, 'unlimited_quantity': True}), (1, 'availability'))
         self.assertEqual(salla.read_quantity({}), (None, None))
 
+    def test_minus_one_means_hidden_not_zero(self):
+        # الشكل الحقيقي من متجر السدلان (2026-10-28): الكمية مخفية = -1
+        real = {'quantity': -1, 'status': 'sale', 'is_available': True, 'is_out_of_stock': False,
+                'unlimited_quantity': False, 'max_quantity': 7}
+        self.assertEqual(salla.read_quantity(real), (1, 'availability'))
+        self.assertEqual(salla.read_quantity(real, use_max=True), (7, 'max_quantity'))
+        # بروف كار: بلا حدود، سقف 500 ثابت → ليس مخزوناً
+        unlimited = {**real, 'unlimited_quantity': True, 'max_quantity': 500}
+        self.assertEqual(salla.read_quantity(unlimited, use_max=True), (1, 'availability'))
+
+    def test_max_quantity_informative(self):
+        self.assertTrue(salla.max_quantity_informative([{'max_quantity': m} for m in (1, 1, 2, 7, 3)]))
+        self.assertFalse(salla.max_quantity_informative([{'max_quantity': 5}] * 10))
+        self.assertFalse(salla.max_quantity_informative(
+            [{'max_quantity': m, 'unlimited_quantity': True} for m in (1, 2, 3, 4, 5)]))
+
     def test_product_to_rows_single(self):
         p = {'id': 55, 'name': 'فانوس', 'sku': '_', 'price': {'amount': 200}, 'sale_price': 150,
              'is_on_sale': True, 'quantity': 3, 'image': {'url': 'i.jpg'}, 'url': 'u',
@@ -109,6 +125,24 @@ class SallaHarvestFlowTests(unittest.TestCase):
         self.assertEqual(len(rows), 200)
         self.assertLess(store.stats['details'], 60)  # لم يطلب 200 تفصيلاً
         self.assertTrue(all(r['quantity'] == 1 and r['quantity_source'] == 'availability' for r in rows))
+
+    def test_hidden_quantity_with_varying_max_uses_it_as_stock(self):
+        listing = [{'id': i, 'name': f'n{i}', 'price': 10, 'quantity': -1} for i in range(1, 41)]
+        details = {str(i): {'id': i, 'name': f'n{i}', 'price': 10, 'quantity': -1, 'is_available': True,
+                            'unlimited_quantity': False, 'max_quantity': (i % 4) + 1} for i in range(1, 41)}
+        store = self.make_store(listing, details, {})
+        rows = store.harvest()
+        self.assertEqual(store.stats['details'], 40)  # التفاصيل تضيف السقف فلا توقّف
+        self.assertTrue(all(r['quantity_source'] == 'max_quantity' for r in rows))
+        self.assertEqual(sorted({r['quantity'] for r in rows}), [1, 2, 3, 4])
+
+    def test_unmatched_sitemap_urls_are_capped_not_scraped(self):
+        listing = [{'id': i, 'name': f'n{i}', 'price': 10, 'quantity': 2, 'url': f'https://shop.test/x/{i}'}
+                   for i in range(1, 11)]
+        sitemap = {f'u:/y/{i}': f'https://shop.test/y/{i}' for i in range(100)}
+        store = self.make_store(listing, {}, sitemap)
+        self.assertEqual(len(store.harvest()), 10)
+        store.html_product.assert_not_called()
 
     def test_html_fallback_when_api_unavailable(self):
         store = self.make_store([], {}, {'7': 'https://shop.test/x/p7'})
