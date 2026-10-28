@@ -11,7 +11,7 @@ import argparse
 import concurrent.futures
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from supabase import Client, create_client
 
@@ -23,7 +23,7 @@ MAX_WORKERS = 2  # Zid: عاملان فقط لتجنّب استفزاز حماي
 BATCH_SIZE = 500
 CORE_COLUMNS = {'store_id', 'sku', 'product_name', 'price', 'quantity', 'product_url',
                 'main_image', 'detected_category', 'last_updated'}
-# أعمدة تضيفها الهجرة 001 في مستودع AshhabRadar؛ تُرسَل فقط إن وُجدت في القاعدة
+# أعمدة أضافتها هجرة harvester_columns في مستودع AshhabRadar؛ تُرسَل فقط إن وُجدت في القاعدة
 OPTIONAL_COLUMNS = ['quantity_source', 'platform_product_id', 'sold_count']
 
 
@@ -79,6 +79,35 @@ def write_rows(db, rows, allowed_columns):
         db.table('live_inventory').upsert(batch, on_conflict='store_id,sku').execute()
 
 
+def known_products(db, store):
+    """عدد منتجات المتجر التي رأتها التمريرة الناجحة السابقة (قبل كتابة التمريرة الحالية)."""
+    try:
+        q = db.table('live_inventory').select('id', count='exact').eq('store_id', store['id'])
+        if store.get('last_crawl_at'):
+            q = q.gte('last_updated', (datetime.fromisoformat(store['last_crawl_at']) - timedelta(days=1)).isoformat())
+        return q.limit(1).execute().count or 0
+    except Exception:
+        return 0
+
+
+def stamp_crawl(db, store, seen, known, started):
+    """يبصم stores_config.last_crawl_at حين تغطّي التمريرة نصف المنتجات المعروفة على الأقل.
+
+    العروض تُخفي المنتج الذي لم تره آخر تمريرة ناجحة (حُذف من المتجر)، فتمريرة جزئية — حجبٌ
+    مؤقت أو انقطاع — لا يجوز أن تُخفي بقية المنتجات؛ لذلك لا تُبصم.
+    """
+    if known and seen < known * 0.5:
+        print(f"   ⚠️ تمريرة جزئية ({seen} من {known} معروف) — لا تُبصم ولا يُخفى شيء")
+        return
+    try:
+        db.table('stores_config').update({'last_crawl_at': started, 'last_crawl_count': seen}).eq('id', store['id']).execute()
+        # منتج لم تره أي تمريرة ناجحة منذ 30 يوماً حُذف من المتجر فعلاً
+        stale = (datetime.fromisoformat(started) - timedelta(days=30)).isoformat()
+        db.table('live_inventory').delete().eq('store_id', store['id']).lt('last_updated', stale).execute()
+    except Exception as e:  # أعمدة الهجرة غير موجودة: البصمة اختيارية
+        print(f"   ℹ️ تعذّر بصم التمريرة: {e!r}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--store', type=int, action='append', help='معرّف متجر (يتكرّر)')
@@ -102,7 +131,7 @@ def main():
     allowed = CORE_COLUMNS | set(available_optional_columns(db))
     missing_opt = [c for c in OPTIONAL_COLUMNS if c not in allowed]
     if missing_opt:
-        print(f"ℹ️ أعمدة غير موجودة بعد في live_inventory (طبّق الهجرة 001): {missing_opt}")
+        print(f"ℹ️ أعمدة غير موجودة بعد في live_inventory (هجرات AshhabRadar/supabase/migrations): {missing_opt}")
 
     failures = []
     for store in stores:
@@ -142,8 +171,10 @@ def main():
             for r in rows[:5]:
                 print('   •', {k: r.get(k) for k in ('sku', 'product_name', 'price', 'quantity', 'quantity_source')})
             continue
+        known = known_products(db, store)
         write_rows(db, rows, allowed)
         print(f"✅ رُفع ({name})")
+        stamp_crawl(db, store, len(rows), known, started)
 
     print('\n🎉 انتهى.' + (f" متاجر فشلت: {failures}" if failures else ''))
     if failures:
